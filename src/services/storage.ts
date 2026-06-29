@@ -22,7 +22,10 @@ import {
   type AuditLogListOptions,
   createAuditLog as createStoredAuditLog,
   clearAuditLogs as clearStoredAuditLogs,
+  assignInviteUsedBy as assignStoredInviteUsedBy,
   createInvite as createStoredInvite,
+  deleteInvite as deleteStoredInvite,
+  deleteInvalidInvites as deleteStoredInvalidInvites,
   deleteAllInvites as deleteStoredInvites,
   getInvite as findStoredInvite,
   listAuditLogs as listStoredAuditLogs,
@@ -30,7 +33,7 @@ import {
   markInviteUsed as markStoredInviteUsed,
   pruneAuditLogs as pruneStoredAuditLogs,
   pruneAuditLogsToMax as pruneStoredAuditLogsToMax,
-  revokeInvite as revokeStoredInvite,
+  revertInviteUsed as revertStoredInviteUsed,
 } from './storage-admin-repo';
 import {
   bulkDeleteFolders as deleteStoredFolders,
@@ -122,6 +125,9 @@ import {
   consumeAttachmentDownloadToken as consumeStoredAttachmentDownloadToken,
 } from './storage-attachment-token-repo';
 import {
+  consumeTotpLoginCounter as consumeStoredTotpLoginCounter,
+} from './storage-totp-replay-repo';
+import {
   getRevisionDate as getStoredRevisionDate,
   updateRevisionDate as updateStoredRevisionDate,
 } from './storage-revision-repo';
@@ -148,8 +154,8 @@ const STORAGE_SCHEMA_VERSION_KEY = 'schema.version';
 // Bump this whenever src/services/storage-schema.ts or migrations/0001_init.sql
 // changes. Existing D1 installs only rerun ensureStorageSchema() when this value
 // differs from config.schema.version.
-const STORAGE_SCHEMA_VERSION = '2026-06-22-push-notifications';
-const REQUIRED_SCHEMA_TABLES = ['webauthn_credentials', 'webauthn_challenges', 'auth_requests'] as const;
+const STORAGE_SCHEMA_VERSION = '2026-06-23-totp-login-replay';
+const REQUIRED_SCHEMA_TABLES = ['webauthn_credentials', 'webauthn_challenges', 'auth_requests', 'totp_login_replays'] as const;
 
 // D1-backed storage.
 // Contract:
@@ -162,10 +168,13 @@ export class StorageService {
   private static schemaVerified = false;
   private static lastRefreshTokenCleanupAt = 0;
   private static lastAttachmentTokenCleanupAt = 0;
+  private static lastTotpReplayCleanupAt = 0;
   private static readonly MAX_D1_SQL_VARIABLES = 100;
 
   private static readonly REFRESH_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.refreshTokenCleanupIntervalMs;
   private static readonly ATTACHMENT_TOKEN_CLEANUP_INTERVAL_MS = LIMITS.cleanup.attachmentTokenCleanupIntervalMs;
+  private static readonly TOTP_REPLAY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000;
+  private static readonly TOTP_REPLAY_MARKER_TTL_MS = 5 * 60 * 1000;
   private static readonly PERIODIC_CLEANUP_PROBABILITY = LIMITS.cleanup.cleanupProbability;
 
   constructor(private db: D1Database) {}
@@ -313,8 +322,20 @@ export class StorageService {
     return markStoredInviteUsed(this.db, code, userId);
   }
 
-  async revokeInvite(code: string): Promise<boolean> {
-    return revokeStoredInvite(this.db, code);
+  async assignInviteUsedBy(code: string, userId: string): Promise<boolean> {
+    return assignStoredInviteUsedBy(this.db, code, userId);
+  }
+
+  async revertInviteUsed(code: string, userId: string): Promise<boolean> {
+    return revertStoredInviteUsed(this.db, code, userId);
+  }
+
+  async deleteInvite(code: string): Promise<boolean> {
+    return deleteStoredInvite(this.db, code);
+  }
+
+  async deleteInvalidInvites(): Promise<number> {
+    return deleteStoredInvalidInvites(this.db);
   }
 
   async deleteAllInvites(): Promise<number> {
@@ -821,6 +842,24 @@ export class StorageService {
 
   async getTrustedTwoFactorDeviceTokenUserId(token: string, deviceIdentifier: string): Promise<string | null> {
     return findStoredTrustedTokenUserId(this.db, this.trustedTwoFactorTokenKey.bind(this), token, deviceIdentifier);
+  }
+
+  async consumeTotpLoginCounter(userId: string, timeCounter: number, consumedAtMs: number = Date.now()): Promise<boolean> {
+    if (!Number.isSafeInteger(timeCounter) || timeCounter < 0) return false;
+    const result = await consumeStoredTotpLoginCounter(
+      this.db,
+      this.shouldRunPeriodicCleanup.bind(this),
+      StorageService.lastTotpReplayCleanupAt,
+      StorageService.TOTP_REPLAY_CLEANUP_INTERVAL_MS,
+      userId,
+      timeCounter,
+      consumedAtMs,
+      StorageService.TOTP_REPLAY_MARKER_TTL_MS
+    );
+    if (result.cleanedUpAt !== null) {
+      StorageService.lastTotpReplayCleanupAt = result.cleanedUpAt;
+    }
+    return result.consumed;
   }
 
   // --- Revision dates ---
